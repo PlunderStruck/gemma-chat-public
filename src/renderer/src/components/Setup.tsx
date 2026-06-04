@@ -152,11 +152,6 @@ function WelcomeScreen({
                         Recommended
                       </span>
                     )}
-                    {m.runtime === 'mlx-vlm' && (
-                      <span className="rounded-full bg-sky-400/15 px-2 py-[1px] text-[10px] font-medium uppercase tracking-wider text-sky-300">
-                        Multimodal
-                      </span>
-                    )}
                     {m.draftModel && (
                       <span className="rounded-full bg-amber-400/15 px-2 py-[1px] text-[10px] font-medium uppercase tracking-wider text-amber-300">
                         ⚡ Speculative

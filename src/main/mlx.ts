@@ -376,7 +376,7 @@ export async function startServer(
   model: string,
   onProgress?: (p: ServerProgress) => void,
   draftModel?: string,
-  runtime: Runtime = 'mlx-lm',
+  runtime: Runtime = 'mlx-vlm',
   expectedBytes?: number
 ): Promise<void> {
   const draft = draftModel ?? null

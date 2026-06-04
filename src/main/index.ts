@@ -88,9 +88,10 @@ function draftModelFor(model: string): string | undefined {
   return AVAILABLE_MODELS.find((m) => m.name === model)?.draftModel
 }
 
-/** Which local runtime serves a given model (defaults to mlx-lm). */
+/** Which local runtime serves a given model. Every Gemma 4 model is multimodal,
+ * so mlx-vlm is the default; mlx-lm is only used if a model opts into it. */
 function runtimeFor(model: string): 'mlx-lm' | 'mlx-vlm' {
-  return AVAILABLE_MODELS.find((m) => m.name === model)?.runtime ?? 'mlx-lm'
+  return AVAILABLE_MODELS.find((m) => m.name === model)?.runtime ?? 'mlx-vlm'
 }
 
 async function ensureMLXRunning(model: string): Promise<string> {
