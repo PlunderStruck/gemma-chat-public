@@ -413,6 +413,11 @@ function Header({
                           rec
                         </span>
                       )}
+                      {m.draftModel && (
+                        <span className="rounded-full bg-amber-400/15 px-1.5 py-[1px] text-[9px] font-medium uppercase tracking-wider text-amber-300">
+                          ⚡
+                        </span>
+                      )}
                     </div>
                     <div className="mt-0.5 text-[11px] text-ink-400">{m.size}</div>
                   </div>

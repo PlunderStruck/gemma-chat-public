@@ -86,6 +86,13 @@ export interface ModelInfo {
   sizeBytes: number
   description: string
   recommended?: boolean
+  /**
+   * Optional HuggingFace repo of a small "assistant" model used as the
+   * speculative-decoding draft. When set, mlx_lm.server is launched with
+   * `--draft-model`, which speeds up generation by drafting tokens with the
+   * smaller model and verifying them with the main model in a single pass.
+   */
+  draftModel?: string
 }
 
 export const AVAILABLE_MODELS: ModelInfo[] = [
@@ -103,6 +110,15 @@ export const AVAILABLE_MODELS: ModelInfo[] = [
     sizeBytes: 3_000_000_000,
     description: 'Best all-rounder. Text + image + audio. Runs on 8GB+ Macs.',
     recommended: true
+  },
+  {
+    name: 'mlx-community/gemma-4-12B-it-4bit',
+    label: 'Gemma 4 12B',
+    size: '11 GB',
+    sizeBytes: 11_000_000_000,
+    description:
+      'Dense 12B. Strong quality with speculative decoding via a paired assistant draft model for faster generation. 16GB+ RAM recommended.',
+    draftModel: 'mlx-community/gemma-4-12B-it-assistant-4bit'
   },
   {
     name: 'mlx-community/gemma-4-26b-a4b-it-4bit',

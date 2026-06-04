@@ -9,6 +9,10 @@ const MLX_URL = `http://${MLX_HOST}`
 
 let serverProc: ChildProcess | null = null
 let currentModel: string | null = null
+let currentDraftModel: string | null = null
+
+/** Tokens drafted per step by the assistant model when speculative decoding is on. */
+const NUM_DRAFT_TOKENS = 4
 
 // ---------------------------------------------------------------------------
 // Paths — everything lives under <appData>/mlx/
@@ -257,6 +261,55 @@ function runProcess(
 }
 
 // ---------------------------------------------------------------------------
+// Draft-model (speculative decoding) support
+// ---------------------------------------------------------------------------
+
+/** Oldest mlx-lm that accepts the `--draft-model` server flag. */
+const MLX_LM_DRAFT_MIN = '0.20.0'
+
+/** True if semantic version `installed` is >= `min` (e.g. '0.24.1' >= '0.20.0'). */
+function versionGte(installed: string, min: string): boolean {
+  const iParts = installed.split('.').map((p) => parseInt(p, 10) || 0)
+  const mParts = min.split('.').map((p) => parseInt(p, 10) || 0)
+  for (let i = 0; i < 3; i++) {
+    const iv = iParts[i] ?? 0
+    const mv = mParts[i] ?? 0
+    if (iv > mv) return true
+    if (iv < mv) return false
+  }
+  return true
+}
+
+/**
+ * Make sure the installed mlx-lm is new enough to understand `--draft-model`
+ * before we launch the server with it. Fresh installs already pin a recent
+ * version, but a venv provisioned by an older build of this app might predate
+ * speculative-decoding support — in that case we transparently upgrade it.
+ */
+export async function ensureDraftSupport(
+  python: string,
+  onProgress?: (p: ServerProgress) => void
+): Promise<void> {
+  const check = spawnSync(
+    python,
+    ['-c', 'import mlx_lm; print(getattr(mlx_lm, "__version__", "0.0.0"))'],
+    { timeout: 10000, stdio: ['ignore', 'pipe', 'pipe'] }
+  )
+  const installed = check.status === 0 ? (check.stdout?.toString().trim() || '') : ''
+  if (installed && versionGte(installed, MLX_LM_DRAFT_MIN)) return
+
+  console.log(
+    `[mlx] mlx-lm ${installed || '(unknown)'} too old for --draft-model; upgrading to >=${MLX_LM_DRAFT_MIN}…`
+  )
+  onProgress?.({ message: 'Updating MLX runtime for speculative decoding…' })
+  await runProcess(
+    python,
+    ['-m', 'pip', 'install', '--upgrade', `mlx-lm>=${MLX_LM_DRAFT_MIN}`, '--index-url', 'https://pypi.org/simple/'],
+    (p) => onProgress?.({ message: p.message })
+  )
+}
+
+// ---------------------------------------------------------------------------
 // Server lifecycle
 // ---------------------------------------------------------------------------
 
@@ -269,12 +322,23 @@ export interface ServerProgress {
 export async function startServer(
   python: string,
   model: string,
-  onProgress?: (p: ServerProgress) => void
+  onProgress?: (p: ServerProgress) => void,
+  draftModel?: string
 ): Promise<void> {
-  if (serverProc && !serverProc.killed && currentModel === model) return
+  const draft = draftModel ?? null
+  // Already running with the exact same (model, draft) pair — nothing to do.
+  if (serverProc && !serverProc.killed && currentModel === model && currentDraftModel === draft)
+    return
 
-  // Kill existing server if running with different model
-  stopServer()
+  // If we're about to use speculative decoding, make sure the runtime is new
+  // enough to accept --draft-model before we hand it that flag.
+  if (draft) {
+    await ensureDraftSupport(python, onProgress)
+  }
+
+  // Kill any existing server and wait for it to fully release the port before
+  // we bind a new one to it.
+  await stopServer()
 
   const env = {
     ...process.env,
@@ -288,21 +352,26 @@ export async function startServer(
   let earlyExit: { code: number | null; stderr: string } | null = null
   let stderrBuf = ''
 
-  console.log(`[mlx] Starting server: ${python} -m mlx_lm.server --model ${model} --port ${MLX_PORT}`)
+  // Base args, plus optional speculative-decoding draft model.
+  const args = ['-m', 'mlx_lm.server', '--model', model, '--port', String(MLX_PORT)]
+  if (draft) {
+    args.push('--draft-model', draft, '--num-draft-tokens', String(NUM_DRAFT_TOKENS))
+  }
 
-  serverProc = spawn(
-    python,
-    ['-m', 'mlx_lm.server', '--model', model, '--port', String(MLX_PORT)],
-    {
-      env,
-      stdio: ['ignore', 'pipe', 'pipe'],
-      detached: false
-    }
-  )
+  console.log(`[mlx] Starting server: ${python} ${args.join(' ')}`)
+
+  serverProc = spawn(python, args, {
+    env,
+    stdio: ['ignore', 'pipe', 'pipe'],
+    detached: false
+  })
   currentModel = model
+  currentDraftModel = draft
 
-  serverProc.stdout?.on('data', (d) => console.log('[mlx]', d.toString().trim()))
-  serverProc.stderr?.on('data', (d) => {
+  const thisProc = serverProc
+
+  thisProc.stdout?.on('data', (d) => console.log('[mlx]', d.toString().trim()))
+  thisProc.stderr?.on('data', (d) => {
     const text = d.toString()
     stderrBuf += text
     console.log('[mlx]', text.trim())
@@ -332,11 +401,16 @@ export async function startServer(
       }
     }
   })
-  serverProc.on('exit', (code) => {
+  thisProc.on('exit', (code) => {
+    // Only clear global state if this is still the active server. A fast
+    // stop→start (e.g. switching models) can leave a stale exit handler that
+    // would otherwise wipe the replacement server's state.
+    if (serverProc !== thisProc) return
     console.log('[mlx] server exited with code', code)
     earlyExit = { code, stderr: stderrBuf }
     serverProc = null
     currentModel = null
+    currentDraftModel = null
   })
 
   // Wait for the server to become healthy.
@@ -344,12 +418,32 @@ export async function startServer(
   await waitForHealth(600_000, () => earlyExit)
 }
 
-export function stopServer(): void {
-  if (serverProc && !serverProc.killed) {
-    console.log('[mlx] Stopping server')
-    serverProc.kill('SIGTERM')
-    serverProc = null
-    currentModel = null
+export async function stopServer(): Promise<void> {
+  const oldProc = serverProc
+  // Detach global state first so the exit handler treats this as a stale proc.
+  serverProc = null
+  currentModel = null
+  currentDraftModel = null
+
+  if (!oldProc || oldProc.killed || oldProc.exitCode !== null) return
+
+  console.log('[mlx] Stopping server')
+  const onExit = new Promise<boolean>((resolve) => oldProc.once('exit', () => resolve(true)))
+  oldProc.kill('SIGTERM')
+
+  // Wait for the process to actually exit so the next startServer doesn't race
+  // the old process for port 11434. Escalate to SIGKILL if it lingers.
+  const waited = await Promise.race([
+    onExit,
+    new Promise<boolean>((resolve) => setTimeout(() => resolve(false), 5000))
+  ])
+  if (!waited) {
+    console.log('[mlx] Server did not exit after SIGTERM; sending SIGKILL…')
+    oldProc.kill('SIGKILL')
+    await Promise.race([
+      onExit,
+      new Promise<boolean>((resolve) => setTimeout(() => resolve(false), 5000))
+    ])
   }
 }
 

@@ -7,7 +7,6 @@ import {
   installMLX,
   startServer,
   stopServer,
-  hasModel,
   chatStream,
   listLocalModels,
   type MLXChatMessage
@@ -83,6 +82,11 @@ function send(channel: string, payload: unknown): void {
 
 let mlxPython: string | null = null
 
+/** The speculative-decoding draft model paired with a given main model, if any. */
+function draftModelFor(model: string): string | undefined {
+  return AVAILABLE_MODELS.find((m) => m.name === model)?.draftModel
+}
+
 async function ensureMLXRunning(model: string): Promise<string> {
   let mlx = locateMLX()
   if (!mlx) {
@@ -110,18 +114,26 @@ async function ensureMLXRunning(model: string): Promise<string> {
   mlxPython = pythonToUse
 
   const label = AVAILABLE_MODELS.find((m) => m.name === model)?.label ?? model
+  const draftModel = draftModelFor(model)
   send('setup:status', { stage: 'starting-mlx', message: 'Starting model runtime…' })
   send('setup:status', {
     stage: 'downloading-model',
-    message: `Loading ${label}… (first run downloads the model)`
+    message: draftModel
+      ? `Loading ${label} + assistant draft model… (first run downloads both)`
+      : `Loading ${label}… (first run downloads the model)`
   })
-  await startServer(pythonToUse, model, (p) => {
-    send('setup:status', {
-      stage: 'downloading-model',
-      message: p.message,
-      progress: p.progress
-    })
-  })
+  await startServer(
+    pythonToUse,
+    model,
+    (p) => {
+      send('setup:status', {
+        stage: 'downloading-model',
+        message: p.message,
+        progress: p.progress
+      })
+    },
+    draftModel
+  )
   return pythonToUse
 }
 
@@ -487,13 +499,18 @@ app.whenReady().then(async () => {
       if (!mlxPython) {
         throw new Error('MLX Python path not available. Please restart the app.')
       }
-      await startServer(mlxPython, model, (p) => {
-        send('setup:status', {
-          stage: 'downloading-model',
-          message: p.message,
-          progress: p.progress
-        })
-      })
+      await startServer(
+        mlxPython,
+        model,
+        (p) => {
+          send('setup:status', {
+            stage: 'downloading-model',
+            message: p.message,
+            progress: p.progress
+          })
+        },
+        draftModelFor(model)
+      )
       send('setup:status', { stage: 'ready', message: 'Ready to chat.' })
     } catch (e) {
       send('setup:status', {

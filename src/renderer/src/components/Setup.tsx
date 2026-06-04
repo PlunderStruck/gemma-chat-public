@@ -130,6 +130,11 @@ function WelcomeScreen({
                         Recommended
                       </span>
                     )}
+                    {m.draftModel && (
+                      <span className="rounded-full bg-amber-400/15 px-2 py-[1px] text-[10px] font-medium uppercase tracking-wider text-amber-300">
+                        ⚡ Speculative
+                      </span>
+                    )}
                   </div>
                   <span className="text-xs tabular-nums text-ink-400">{m.size}</span>
                 </div>
