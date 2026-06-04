@@ -16,20 +16,67 @@ interface Parsed {
   visible: string
 }
 
+// Thinking spans by [open, close]. Gemma 4 reasons inside channels
+// (`<|channel>thought … <channel|>`) and can inject `<|think|>`; the classic
+// `<think>…</think>` convention is kept for safety / other models. The first
+// matching open token wins, scanning left to right.
+const THINK_SPANS: ReadonlyArray<readonly [string, string]> = [
+  ['<|channel>', '<channel|>'],
+  ['<|think|>', '<channel|>'],
+  ['<think>', '</think>'],
+  ['<thinking>', '</thinking>']
+]
+
+// Control / special tokens that must never render. The mirrored-bar shapes
+// (`<|x>`, `<x|>`, `<|x|>`) are distinctive enough not to collide with prose,
+// markdown, or code; the rest is an explicit allow-list of Gemma's specials.
+const STRAY_TOKEN_RE =
+  /<\|[a-z_]+\|?>|<[a-z_]+\|>|<\/?think(?:ing)?>|<\/?(?:start_of_turn|end_of_turn|bos|eos|pad|mask)>|<unused\d+>/gi
+
+/**
+ * Split an assistant message into hidden "thinking" and the visible answer,
+ * then scrub any stray model control tokens out of the visible text. Handles
+ * Gemma 4's channel format in addition to the `<think>` convention, and an
+ * unclosed thinking span mid-stream (thinkingInProgress).
+ */
 function parseThinking(content: string): Parsed {
-  const openRe = /<think(?:ing)?>/
-  const closeRe = /<\/think(?:ing)?>/
-  const openMatch = content.match(openRe)
-  if (!openMatch) return { thinking: '', thinkingInProgress: false, visible: content }
-  const before = content.slice(0, openMatch.index!)
-  const after = content.slice(openMatch.index! + openMatch[0].length)
-  const closeMatch = after.match(closeRe)
-  if (!closeMatch) {
-    return { thinking: after, thinkingInProgress: true, visible: before }
+  let visible = ''
+  let thinking = ''
+  let inProgress = false
+  let i = 0
+
+  while (i < content.length) {
+    // Earliest thinking-open marker at or after i.
+    let at = -1
+    let span: readonly [string, string] | null = null
+    for (const s of THINK_SPANS) {
+      const idx = content.indexOf(s[0], i)
+      if (idx >= 0 && (at < 0 || idx < at)) {
+        at = idx
+        span = s
+      }
+    }
+    if (at < 0 || !span) {
+      visible += content.slice(i)
+      break
+    }
+    visible += content.slice(i, at)
+    const bodyStart = at + span[0].length
+    const closeAt = content.indexOf(span[1], bodyStart)
+    if (closeAt < 0) {
+      // Unclosed — still streaming; everything after the marker is thinking.
+      thinking += content.slice(bodyStart)
+      inProgress = true
+      break
+    }
+    thinking += content.slice(bodyStart, closeAt) + '\n'
+    i = closeAt + span[1].length
   }
-  const thinking = after.slice(0, closeMatch.index!)
-  const rest = after.slice(closeMatch.index! + closeMatch[0].length)
-  return { thinking, thinkingInProgress: false, visible: (before + rest).trim() }
+
+  visible = visible.replace(STRAY_TOKEN_RE, '')
+  thinking = thinking.replace(STRAY_TOKEN_RE, '').trim()
+
+  return { thinking, thinkingInProgress: inProgress, visible: visible.trim() }
 }
 
 export default function Message({
