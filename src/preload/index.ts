@@ -23,6 +23,9 @@ const api = {
 
   listLocalModels: (): Promise<string[]> => ipcRenderer.invoke('models:list-local'),
 
+  /** Names of AVAILABLE_MODELS whose weights are already cached on disk. */
+  cachedModels: (): Promise<string[]> => ipcRenderer.invoke('models:cached'),
+
   sendChat: async (req: ChatRequest, onChunk: (c: StreamChunk) => void): Promise<void> => {
     const { channel } = (await ipcRenderer.invoke('chat:send', req)) as { channel: string }
     return new Promise((resolve) => {

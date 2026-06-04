@@ -1,7 +1,7 @@
 import { app } from 'electron'
 import { spawn, ChildProcess, spawnSync } from 'child_process'
 import { join } from 'path'
-import { existsSync, rmSync } from 'fs'
+import { existsSync, readdirSync, rmSync } from 'fs'
 
 const MLX_PORT = 11434
 const MLX_HOST = `127.0.0.1:${MLX_PORT}`
@@ -556,6 +556,43 @@ async function waitForHealth(
 // ---------------------------------------------------------------------------
 // Model management
 // ---------------------------------------------------------------------------
+
+/**
+ * Whether a model's weights already exist in the local HuggingFace cache, so
+ * selecting it won't trigger a fresh download. Inspects the on-disk cache
+ * directly — unlike listLocalModels(), which only reports what a *running*
+ * server has loaded (and so reports nothing on the welcome screen).
+ */
+export function isModelCached(name: string): boolean {
+  const repoDir = join(modelsDir(), 'hub', 'models--' + name.replace(/\//g, '--'))
+  const snapDir = join(repoDir, 'snapshots')
+  if (!existsSync(snapDir)) return false
+
+  // A half-finished download leaves *.incomplete blobs — treat as not cached.
+  try {
+    const blobsDir = join(repoDir, 'blobs')
+    if (existsSync(blobsDir) && readdirSync(blobsDir).some((f) => f.endsWith('.incomplete'))) {
+      return false
+    }
+  } catch {
+    /* ignore — fall through to the snapshot check */
+  }
+
+  // Cached when some snapshot revision actually contains weight files.
+  try {
+    return readdirSync(snapDir).some((rev) => {
+      try {
+        return readdirSync(join(snapDir, rev)).some(
+          (f) => f.endsWith('.safetensors') || f.endsWith('.gguf')
+        )
+      } catch {
+        return false
+      }
+    })
+  } catch {
+    return false
+  }
+}
 
 export async function listLocalModels(): Promise<string[]> {
   try {

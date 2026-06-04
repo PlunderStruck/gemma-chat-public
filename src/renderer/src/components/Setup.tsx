@@ -1,3 +1,4 @@
+import { useEffect, useState } from 'react'
 import { AVAILABLE_MODELS, type SetupStatus } from '@shared/types'
 import gemmaLogoUrl from '../assets/gemma-logo.png'
 
@@ -93,6 +94,22 @@ function WelcomeScreen({
   onStart: (model: string) => void
 }) {
   const selected = AVAILABLE_MODELS.find((m) => m.name === model) ?? AVAILABLE_MODELS[1]
+
+  // Which models already have weights on disk — lets us show "Ready/Load"
+  // instead of "Download" (the running-server check can't see the cache here).
+  const [cached, setCached] = useState<Set<string>>(new Set())
+  useEffect(() => {
+    let alive = true
+    window.api
+      .cachedModels()
+      .then((names) => alive && setCached(new Set(names)))
+      .catch(() => {})
+    return () => {
+      alive = false
+    }
+  }, [])
+  const selectedCached = cached.has(selected.name)
+
   return (
     <div className="drag flex h-full w-full flex-col">
       <div className="h-9" />
@@ -125,6 +142,11 @@ function WelcomeScreen({
                 <div className="flex items-center justify-between">
                   <div className="flex items-center gap-2">
                     <span className="font-medium">{m.label}</span>
+                    {cached.has(m.name) && (
+                      <span className="rounded-full bg-emerald-400/15 px-2 py-[1px] text-[10px] font-medium uppercase tracking-wider text-emerald-300">
+                        Ready
+                      </span>
+                    )}
                     {m.recommended && (
                       <span className="rounded-full bg-white/10 px-2 py-[1px] text-[10px] font-medium uppercase tracking-wider text-ink-100">
                         Recommended
@@ -154,10 +176,16 @@ function WelcomeScreen({
             onClick={() => onStart(selected.name)}
             className="mt-6 w-full rounded-xl bg-white py-3 text-sm font-medium text-ink-900 transition hover:bg-white/90 active:scale-[0.99]"
           >
-            Download {selected.label} &nbsp;·&nbsp; {selected.size}
+            {selectedCached ? (
+              <>Load {selected.label}</>
+            ) : (
+              <>Download {selected.label} &nbsp;·&nbsp; {selected.size}</>
+            )}
           </button>
           <p className="mt-3 text-center text-[11px] text-ink-400">
-            We'll install MLX runtime if needed. Model weights are cached locally.
+            {selectedCached
+              ? 'Already on your Mac — starts from the local cache.'
+              : "We'll install MLX runtime if needed. Model weights are cached locally."}
           </p>
         </div>
       </div>

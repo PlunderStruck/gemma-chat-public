@@ -9,6 +9,7 @@ import {
   stopServer,
   chatStream,
   listLocalModels,
+  isModelCached,
   type MLXChatMessage
 } from './mlx'
 import {
@@ -128,11 +129,14 @@ async function ensureMLXRunning(model: string): Promise<string> {
       message: 'Preparing multimodal runtime (mlx-vlm)…'
     })
   }
+  const cached = isModelCached(model)
   send('setup:status', {
     stage: 'downloading-model',
-    message: draftModel
-      ? `Loading ${label} + assistant draft model… (first run downloads both)`
-      : `Loading ${label}… (first run downloads the model)`
+    message: cached
+      ? `Loading ${label} from local cache…`
+      : draftModel
+        ? `Loading ${label} + assistant draft model… (first run downloads both)`
+        : `Loading ${label}… (first run downloads the model)`
   })
   await startServer(
     pythonToUse,
@@ -580,6 +584,12 @@ app.whenReady().then(async () => {
 
   ipcMain.handle('models:list-local', async () => {
     return listLocalModels()
+  })
+
+  // Which AVAILABLE_MODELS already have weights on disk (so the picker can show
+  // "Ready/Load" instead of "Download"). Checks the HF cache directly.
+  ipcMain.handle('models:cached', async () => {
+    return AVAILABLE_MODELS.filter((m) => isModelCached(m.name)).map((m) => m.name)
   })
 
   ipcMain.handle('chat:send', async (_e, req: ChatRequest) => {
