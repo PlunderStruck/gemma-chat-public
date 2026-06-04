@@ -1,7 +1,7 @@
 import { app } from 'electron'
 import { spawn, ChildProcess, spawnSync } from 'child_process'
 import { join } from 'path'
-import { existsSync, readdirSync, rmSync } from 'fs'
+import { existsSync, readdirSync, readFileSync, rmSync, statSync } from 'fs'
 
 const MLX_PORT = 11434
 const MLX_HOST = `127.0.0.1:${MLX_PORT}`
@@ -366,6 +366,9 @@ export interface ServerProgress {
   message: string
   /** 0.0–1.0 progress fraction, if available */
   progress?: number
+  /** Bytes downloaded so far / total, when a byte-accurate measure is available. */
+  bytesDone?: number
+  bytesTotal?: number
 }
 
 export async function startServer(
@@ -373,7 +376,8 @@ export async function startServer(
   model: string,
   onProgress?: (p: ServerProgress) => void,
   draftModel?: string,
-  runtime: Runtime = 'mlx-lm'
+  runtime: Runtime = 'mlx-lm',
+  expectedBytes?: number
 ): Promise<void> {
   const draft = draftModel ?? null
   // Already running with the exact same (model, draft, runtime) — nothing to do.
@@ -445,31 +449,10 @@ export async function startServer(
     const text = d.toString()
     stderrBuf += text
     console.log('[mlx]', text.trim())
-
-    // Parse HuggingFace download progress from stderr
-    // Format: "Fetching 8 files:  50%|█████     | 4/8 [00:55<00:59, 14.98s/it]"
-    if (onProgress) {
-      const lines = text.split('\n')
-      for (const line of lines) {
-        // Match "Fetching N files: XX%" pattern
-        const fetchMatch = line.match(/Fetching\s+(\d+)\s+files?:\s+(\d+)%.*?(\d+)\/(\d+)/)
-        if (fetchMatch) {
-          const pct = parseInt(fetchMatch[2], 10)
-          const done = parseInt(fetchMatch[3], 10)
-          const total = parseInt(fetchMatch[4], 10)
-          onProgress({
-            message: `Downloading model files… ${done}/${total}`,
-            progress: pct / 100
-          })
-          continue
-        }
-
-        // Match loading messages
-        if (line.includes('Starting httpd') || line.includes('starting')) {
-          onProgress({ message: 'Starting server…', progress: 1.0 })
-        }
-      }
-    }
+    // NOTE: download progress is reported by waitForReady from on-disk bytes,
+    // not parsed here. The stderr "Fetching N files" counter is coarse and,
+    // more importantly, the server answers /v1/models before the download even
+    // starts — so readiness must be gated on the weights actually being on disk.
   })
   thisProc.on('exit', (code) => {
     // Only clear global state if this is still the active server. A fast
@@ -484,9 +467,13 @@ export async function startServer(
     currentRuntime = null
   })
 
-  // Wait for the server to become healthy.
-  // First run downloads model weights from HuggingFace, so allow up to 10 min.
-  await waitForHealth(600_000, () => earlyExit)
+  // Wait until the model is genuinely ready: the HTTP server answers AND the
+  // weights are fully on disk. mlx_lm.server answers /v1/models within ~1s of
+  // launch — long before the download finishes — so "port answers" alone would
+  // report "ready" far too early (causing the setup screen to flicker to chat
+  // and back). A progressing download never times out (stall-detected instead);
+  // 3h is just an absolute backstop.
+  await waitForReady(model, expectedBytes, 10_800_000, () => earlyExit, onProgress)
 }
 
 export async function stopServer(): Promise<void> {
@@ -520,37 +507,97 @@ export async function stopServer(): Promise<void> {
 }
 
 /**
- * Poll the server's /v1/models endpoint until it responds.
- * If the server process exits early, throw immediately.
+ * Wait until a model is genuinely ready to serve: the HTTP server answers AND
+ * its weights are fully downloaded on disk. Emits byte-accurate download
+ * progress while waiting. Throws if the process exits early or the timeout
+ * elapses.
+ *
+ * Both conditions are required because the two runtimes behave oppositely:
+ * mlx_lm.server binds its port and answers /v1/models within ~1s of launch —
+ * before downloading anything — so "the port answers" fires far too early;
+ * mlx_vlm.server instead loads the model before it starts serving. Gating on
+ * (port answers AND weights on disk) is correct for both.
  */
-async function waitForHealth(
+async function waitForReady(
+  model: string,
+  expectedBytes: number | undefined,
   timeoutMs: number,
-  checkEarlyExit: () => { code: number | null; stderr: string } | null
+  checkEarlyExit: () => { code: number | null; stderr: string } | null,
+  onProgress?: (p: ServerProgress) => void
 ): Promise<void> {
   const start = Date.now()
+  // Primary failure modes — far more useful than a flat overall timeout, which
+  // would falsely fail a slow-but-progressing multi-GB download:
+  const STALL_MS = 5 * 60_000 // no new bytes for 5 min during download → give up
+  const LOAD_GRACE_MS = 10 * 60_000 // weights on disk but server never serves → give up
   let lastError: unknown = null
+  let httpUp = false
+  let maxBytes = 0
+  let lastProgressAt = Date.now()
+  let downloadedAt = 0
 
   while (Date.now() - start < timeoutMs) {
-    // Check if the server process crashed
     const exit = checkEarlyExit()
     if (exit) {
-      throw new Error(
-        `MLX server exited with code ${exit.code}. ${exit.stderr.slice(-500)}`
-      )
+      throw new Error(`MLX server exited with code ${exit.code}. ${exit.stderr.slice(-500)}`)
     }
 
-    try {
-      const res = await fetch(`${MLX_URL}/v1/models`)
-      if (res.ok) {
-        console.log('[mlx] Server is healthy')
-        return
+    const downloaded = isModelCached(model)
+
+    if (!downloaded) {
+      // Still fetching weights — track progress for stall detection + report bytes.
+      const done = modelCacheBytes(model)
+      if (done > maxBytes) {
+        maxBytes = done
+        lastProgressAt = Date.now()
+      } else if (Date.now() - lastProgressAt > STALL_MS) {
+        throw new Error(
+          `Model download stalled — no progress for ${Math.round(STALL_MS / 60000)} min. Check your connection and try again.`
+        )
       }
-    } catch (e) {
-      lastError = e
+      if (onProgress) {
+        const total = modelTotalBytes(model) ?? (expectedBytes && expectedBytes > 0 ? expectedBytes : 0)
+        onProgress(
+          total > 0
+            ? {
+                message: 'Downloading model…',
+                progress: Math.min(0.99, done / total),
+                bytesDone: done,
+                bytesTotal: total
+              }
+            : { message: 'Downloading model…' }
+        )
+      }
+    } else {
+      // Weights are on disk; the runtime is loading them into memory.
+      if (downloadedAt === 0) downloadedAt = Date.now()
+      if (!httpUp) {
+        if (Date.now() - downloadedAt > LOAD_GRACE_MS) {
+          throw new Error(
+            `Model downloaded but the server did not start within ${Math.round(LOAD_GRACE_MS / 60000)} min.`
+          )
+        }
+        onProgress?.({ message: 'Loading model…', progress: 1 })
+      }
     }
-    await new Promise((r) => setTimeout(r, 1500))
+
+    if (!httpUp) {
+      try {
+        const res = await fetch(`${MLX_URL}/v1/models`)
+        if (res.ok) httpUp = true
+      } catch (e) {
+        lastError = e
+      }
+    }
+
+    if (httpUp && downloaded) {
+      console.log('[mlx] Server is healthy and weights are on disk')
+      return
+    }
+
+    await new Promise((r) => setTimeout(r, 1200))
   }
-  throw new Error(`MLX server did not become healthy within ${timeoutMs / 1000}s: ${String(lastError)}`)
+  throw new Error(`MLX server did not become ready in time: ${String(lastError)}`)
 }
 
 // ---------------------------------------------------------------------------
@@ -564,7 +611,7 @@ async function waitForHealth(
  * server has loaded (and so reports nothing on the welcome screen).
  */
 export function isModelCached(name: string): boolean {
-  const repoDir = join(modelsDir(), 'hub', 'models--' + name.replace(/\//g, '--'))
+  const repoDir = modelRepoDir(name)
   const snapDir = join(repoDir, 'snapshots')
   if (!existsSync(snapDir)) return false
 
@@ -592,6 +639,53 @@ export function isModelCached(name: string): boolean {
   } catch {
     return false
   }
+}
+
+/** Absolute path of a model's HuggingFace cache repo dir. */
+function modelRepoDir(name: string): string {
+  return join(modelsDir(), 'hub', 'models--' + name.replace(/\//g, '--'))
+}
+
+/** Bytes currently on disk for a model (sum of its blobs, including partial *.incomplete). */
+function modelCacheBytes(name: string): number {
+  const blobsDir = join(modelRepoDir(name), 'blobs')
+  if (!existsSync(blobsDir)) return 0
+  let total = 0
+  try {
+    for (const f of readdirSync(blobsDir)) {
+      try {
+        total += statSync(join(blobsDir, f)).size
+      } catch {
+        /* file vanished between listing and stat — ignore */
+      }
+    }
+  } catch {
+    /* ignore */
+  }
+  return total
+}
+
+/**
+ * Total expected bytes for a model's weights, read from its
+ * model.safetensors.index.json (downloaded early). Returns null if not yet
+ * available so callers can fall back to a coarse estimate.
+ */
+function modelTotalBytes(name: string): number | null {
+  const snapDir = join(modelRepoDir(name), 'snapshots')
+  if (!existsSync(snapDir)) return null
+  try {
+    for (const rev of readdirSync(snapDir)) {
+      const idx = join(snapDir, rev, 'model.safetensors.index.json')
+      if (existsSync(idx)) {
+        const meta = JSON.parse(readFileSync(idx, 'utf8'))?.metadata
+        const total = meta?.total_size
+        if (typeof total === 'number' && total > 0) return total
+      }
+    }
+  } catch {
+    /* ignore */
+  }
+  return null
 }
 
 export async function listLocalModels(): Promise<string[]> {

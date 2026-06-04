@@ -119,7 +119,8 @@ async function ensureMLXRunning(model: string): Promise<string> {
 
   mlxPython = pythonToUse
 
-  const label = AVAILABLE_MODELS.find((m) => m.name === model)?.label ?? model
+  const info = AVAILABLE_MODELS.find((m) => m.name === model)
+  const label = info?.label ?? model
   const draftModel = draftModelFor(model)
   const runtime = runtimeFor(model)
   send('setup:status', { stage: 'starting-mlx', message: 'Starting model runtime…' })
@@ -145,11 +146,14 @@ async function ensureMLXRunning(model: string): Promise<string> {
       send('setup:status', {
         stage: 'downloading-model',
         message: p.message,
-        progress: p.progress
+        progress: p.progress,
+        bytesDone: p.bytesDone,
+        bytesTotal: p.bytesTotal
       })
     },
     draftModel,
-    runtime
+    runtime,
+    info?.sizeBytes
   )
   return pythonToUse
 }
@@ -561,11 +565,14 @@ app.whenReady().then(async () => {
           send('setup:status', {
             stage: 'downloading-model',
             message: p.message,
-            progress: p.progress
+            progress: p.progress,
+            bytesDone: p.bytesDone,
+            bytesTotal: p.bytesTotal
           })
         },
         draftModelFor(model),
-        runtimeFor(model)
+        runtimeFor(model),
+        AVAILABLE_MODELS.find((m) => m.name === model)?.sizeBytes
       )
       send('setup:status', { stage: 'ready', message: 'Ready to chat.' })
     } catch (e) {
