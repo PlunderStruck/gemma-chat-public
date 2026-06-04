@@ -7,12 +7,18 @@ const MLX_PORT = 11434
 const MLX_HOST = `127.0.0.1:${MLX_PORT}`
 const MLX_URL = `http://${MLX_HOST}`
 
+/** Which local runtime serves a model. mlx-lm = text Gemma 4; mlx-vlm = unified multimodal. */
+export type Runtime = 'mlx-lm' | 'mlx-vlm'
+
 let serverProc: ChildProcess | null = null
 let currentModel: string | null = null
 let currentDraftModel: string | null = null
+let currentRuntime: Runtime | null = null
 
-/** Tokens drafted per step by the assistant model when speculative decoding is on. */
+/** Tokens drafted per step by the assistant model under mlx-lm speculative decoding. */
 const NUM_DRAFT_TOKENS = 4
+/** Block size for mlx-vlm MTP speculative decoding (matches Google's example). */
+const DRAFT_BLOCK_SIZE = 4
 
 // ---------------------------------------------------------------------------
 // Paths — everything lives under <appData>/mlx/
@@ -309,6 +315,49 @@ export async function ensureDraftSupport(
   )
 }
 
+/** Oldest mlx-vlm that loads `gemma4_unified` and accepts the MTP draft flags. */
+const MLX_VLM_MIN = '0.6.1'
+
+/**
+ * Ensure mlx-vlm is installed and recent enough before serving a unified
+ * multimodal model. The base install only provides mlx-lm (text); the
+ * `gemma4_unified` architecture needs mlx-vlm (which bundles mlx-lm). A venv
+ * provisioned by an older build of this app might have an mlx-vlm that predates
+ * `gemma4_unified` / the `--draft-kind mtp` flags, so we version-gate the same
+ * way `ensureDraftSupport` does for mlx-lm and upgrade when needed. Installed on
+ * demand so text-only users keep a lighter footprint. No-op once new enough.
+ */
+export async function ensureVlmRuntime(
+  python: string,
+  onProgress?: (p: ServerProgress) => void
+): Promise<void> {
+  const check = spawnSync(
+    python,
+    ['-c', 'import mlx_vlm; print(getattr(mlx_vlm, "__version__", "0.0.0"))'],
+    { timeout: 15000, stdio: ['ignore', 'pipe', 'pipe'] }
+  )
+  const installed = check.status === 0 ? (check.stdout?.toString().trim() || '') : ''
+  if (installed && versionGte(installed, MLX_VLM_MIN)) return
+
+  const why = installed ? `mlx-vlm ${installed} too old (need >=${MLX_VLM_MIN})` : 'mlx-vlm not found'
+  console.log(`[mlx] ${why}; installing/upgrading for the multimodal runtime…`)
+  onProgress?.({ message: 'Installing multimodal runtime (mlx-vlm)…' })
+  await runProcess(
+    python,
+    ['-m', 'pip', 'install', '--upgrade', `mlx-vlm>=${MLX_VLM_MIN}`, '--index-url', 'https://pypi.org/simple/'],
+    (p) => onProgress?.({ message: p.message })
+  )
+
+  const verify = spawnSync(python, ['-c', 'import mlx_vlm'], {
+    timeout: 15000,
+    stdio: ['ignore', 'pipe', 'pipe']
+  })
+  if (verify.status !== 0) {
+    const err = verify.stderr?.toString().slice(-300) || 'unknown error'
+    throw new Error(`mlx-vlm installed but failed to import: ${err}`)
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Server lifecycle
 // ---------------------------------------------------------------------------
@@ -323,16 +372,26 @@ export async function startServer(
   python: string,
   model: string,
   onProgress?: (p: ServerProgress) => void,
-  draftModel?: string
+  draftModel?: string,
+  runtime: Runtime = 'mlx-lm'
 ): Promise<void> {
   const draft = draftModel ?? null
-  // Already running with the exact same (model, draft) pair — nothing to do.
-  if (serverProc && !serverProc.killed && currentModel === model && currentDraftModel === draft)
+  // Already running with the exact same (model, draft, runtime) — nothing to do.
+  if (
+    serverProc &&
+    !serverProc.killed &&
+    currentModel === model &&
+    currentDraftModel === draft &&
+    currentRuntime === runtime
+  )
     return
 
-  // If we're about to use speculative decoding, make sure the runtime is new
-  // enough to accept --draft-model before we hand it that flag.
-  if (draft) {
+  // Make sure the right runtime is available before launching.
+  if (runtime === 'mlx-vlm') {
+    // Unified multimodal models need mlx-vlm (which also handles MTP drafting).
+    await ensureVlmRuntime(python, onProgress)
+  } else if (draft) {
+    // mlx-lm: confirm it's new enough to accept --draft-model.
     await ensureDraftSupport(python, onProgress)
   }
 
@@ -352,10 +411,20 @@ export async function startServer(
   let earlyExit: { code: number | null; stderr: string } | null = null
   let stderrBuf = ''
 
-  // Base args, plus optional speculative-decoding draft model.
-  const args = ['-m', 'mlx_lm.server', '--model', model, '--port', String(MLX_PORT)]
-  if (draft) {
-    args.push('--draft-model', draft, '--num-draft-tokens', String(NUM_DRAFT_TOKENS))
+  // Build the launch args for the selected runtime. Both expose the same
+  // OpenAI surface (/v1/models, /v1/chat/completions), so only the module and
+  // the speculative-decoding flags differ.
+  let args: string[]
+  if (runtime === 'mlx-vlm') {
+    args = ['-m', 'mlx_vlm.server', '--model', model, '--host', '127.0.0.1', '--port', String(MLX_PORT)]
+    if (draft) {
+      args.push('--draft-model', draft, '--draft-kind', 'mtp', '--draft-block-size', String(DRAFT_BLOCK_SIZE))
+    }
+  } else {
+    args = ['-m', 'mlx_lm.server', '--model', model, '--port', String(MLX_PORT)]
+    if (draft) {
+      args.push('--draft-model', draft, '--num-draft-tokens', String(NUM_DRAFT_TOKENS))
+    }
   }
 
   console.log(`[mlx] Starting server: ${python} ${args.join(' ')}`)
@@ -367,6 +436,7 @@ export async function startServer(
   })
   currentModel = model
   currentDraftModel = draft
+  currentRuntime = runtime
 
   const thisProc = serverProc
 
@@ -411,6 +481,7 @@ export async function startServer(
     serverProc = null
     currentModel = null
     currentDraftModel = null
+    currentRuntime = null
   })
 
   // Wait for the server to become healthy.
@@ -424,6 +495,7 @@ export async function stopServer(): Promise<void> {
   serverProc = null
   currentModel = null
   currentDraftModel = null
+  currentRuntime = null
 
   if (!oldProc || oldProc.killed || oldProc.exitCode !== null) return
 

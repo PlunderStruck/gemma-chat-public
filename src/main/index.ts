@@ -87,6 +87,11 @@ function draftModelFor(model: string): string | undefined {
   return AVAILABLE_MODELS.find((m) => m.name === model)?.draftModel
 }
 
+/** Which local runtime serves a given model (defaults to mlx-lm). */
+function runtimeFor(model: string): 'mlx-lm' | 'mlx-vlm' {
+  return AVAILABLE_MODELS.find((m) => m.name === model)?.runtime ?? 'mlx-lm'
+}
+
 async function ensureMLXRunning(model: string): Promise<string> {
   let mlx = locateMLX()
   if (!mlx) {
@@ -115,7 +120,14 @@ async function ensureMLXRunning(model: string): Promise<string> {
 
   const label = AVAILABLE_MODELS.find((m) => m.name === model)?.label ?? model
   const draftModel = draftModelFor(model)
+  const runtime = runtimeFor(model)
   send('setup:status', { stage: 'starting-mlx', message: 'Starting model runtime…' })
+  if (runtime === 'mlx-vlm') {
+    send('setup:status', {
+      stage: 'starting-mlx',
+      message: 'Preparing multimodal runtime (mlx-vlm)…'
+    })
+  }
   send('setup:status', {
     stage: 'downloading-model',
     message: draftModel
@@ -132,7 +144,8 @@ async function ensureMLXRunning(model: string): Promise<string> {
         progress: p.progress
       })
     },
-    draftModel
+    draftModel,
+    runtime
   )
   return pythonToUse
 }
@@ -547,7 +560,8 @@ app.whenReady().then(async () => {
             progress: p.progress
           })
         },
-        draftModelFor(model)
+        draftModelFor(model),
+        runtimeFor(model)
       )
       send('setup:status', { stage: 'ready', message: 'Ready to chat.' })
     } catch (e) {

@@ -88,11 +88,18 @@ export interface ModelInfo {
   recommended?: boolean
   /**
    * Optional HuggingFace repo of a small "assistant" model used as the
-   * speculative-decoding draft. When set, mlx_lm.server is launched with
+   * speculative-decoding draft. When set, the server is launched with
    * `--draft-model`, which speeds up generation by drafting tokens with the
    * smaller model and verifying them with the main model in a single pass.
    */
   draftModel?: string
+  /**
+   * Which local runtime serves this model. `mlx-lm` (the default) handles the
+   * text Gemma 4 models. `mlx-vlm` is required for the unified multimodal
+   * architecture (`gemma4_unified`), which mlx-lm cannot load; mlx-vlm also
+   * does the assistant-drafter MTP speculative decoding for those models.
+   */
+  runtime?: 'mlx-lm' | 'mlx-vlm'
 }
 
 export const AVAILABLE_MODELS: ModelInfo[] = [
@@ -117,8 +124,9 @@ export const AVAILABLE_MODELS: ModelInfo[] = [
     size: '11 GB',
     sizeBytes: 11_000_000_000,
     description:
-      'Dense 12B. Strong quality with speculative decoding via a paired assistant draft model for faster generation. 16GB+ RAM recommended.',
-    draftModel: 'mlx-community/gemma-4-12B-it-assistant-4bit'
+      'Unified multimodal (text + image + audio). MTP speculative decoding via a paired assistant drafter for faster generation. Runs on the mlx-vlm runtime. 16GB+ RAM recommended.',
+    draftModel: 'mlx-community/gemma-4-12B-it-assistant-4bit',
+    runtime: 'mlx-vlm'
   },
   {
     name: 'mlx-community/gemma-4-26b-a4b-it-4bit',
