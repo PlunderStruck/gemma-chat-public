@@ -496,15 +496,6 @@ export async function listLocalModels(): Promise<string[]> {
   }
 }
 
-export async function hasModel(_name: string): Promise<boolean> {
-  try {
-    const models = await listLocalModels()
-    return models.length > 0
-  } catch {
-    return false
-  }
-}
-
 // ---------------------------------------------------------------------------
 // Chat streaming (OpenAI-compatible SSE)
 // ---------------------------------------------------------------------------

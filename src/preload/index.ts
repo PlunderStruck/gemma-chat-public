@@ -4,7 +4,8 @@ import type {
   SetupStatus,
   StreamChunk,
   WorkspaceInfo,
-  WorkspaceFile
+  WorkspaceFile,
+  FileChangeEvent
 } from '../shared/types'
 
 const api = {
@@ -53,8 +54,8 @@ const api = {
 
   workspaceServerPort: (): Promise<number> => ipcRenderer.invoke('workspace:server-port'),
 
-  onWorkspaceChanged: (cb: (ev: { conversationId: string }) => void): (() => void) => {
-    const listener = (_: IpcRendererEvent, ev: { conversationId: string }): void => cb(ev)
+  onWorkspaceChanged: (cb: (ev: FileChangeEvent) => void): (() => void) => {
+    const listener = (_: IpcRendererEvent, ev: FileChangeEvent): void => cb(ev)
     ipcRenderer.on('workspace:changed', listener)
     return () => ipcRenderer.removeListener('workspace:changed', listener)
   },

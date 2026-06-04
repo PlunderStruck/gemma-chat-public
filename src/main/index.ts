@@ -31,7 +31,7 @@ import {
   workspaceDir,
   wsWriteFile
 } from './workspace'
-import type { ChatRequest, StreamChunk, ToolCall } from '../shared/types'
+import type { ChatRequest, StreamChunk, ToolCall, FileChangeEvent } from '../shared/types'
 
 let mainWindow: BrowserWindow | null = null
 
@@ -163,6 +163,119 @@ function actionTarget(_name: string, args: Record<string, unknown>): string | un
   return undefined
 }
 
+/**
+ * Assemble the model's message context for a request: the mode-specific system
+ * prompt followed by the prior conversation turns (flattening tool results into
+ * `tool` messages). Pure aside from resolving the code-mode workspace path.
+ */
+async function buildBaseMessages(req: ChatRequest): Promise<MLXChatMessage[]> {
+  const baseMessages: MLXChatMessage[] = []
+
+  if (req.mode === 'code') {
+    const wsPath = await ensureWorkspace(req.conversationId)
+    const href = previewUrl(req.conversationId)
+    baseMessages.push({ role: 'system', content: codeSystemPrompt(wsPath, href) })
+  } else {
+    baseMessages.push({ role: 'system', content: chatSystemPrompt(req.enableTools) })
+  }
+
+  for (const m of req.messages) {
+    baseMessages.push({ role: m.role as MLXChatMessage['role'], content: m.content })
+    if (m.toolCalls) {
+      for (const tc of m.toolCalls) {
+        if (tc.result != null) {
+          baseMessages.push({
+            role: 'tool',
+            content: `Result of <action name="${tc.name}">: ${tc.result}`
+          })
+        }
+      }
+    }
+  }
+
+  return baseMessages
+}
+
+/**
+ * Streams a `write_file` action's `<content>` to disk as it arrives, so the
+ * Build-mode canvas can show the file materialising live. Owns the throttling,
+ * partial-content extraction, and preview/persist effects for one file at a
+ * time; reset (via finish) between actions.
+ */
+class LiveFileWriter {
+  private path: string | null = null
+  private contentStart = -1
+  private lastWrite = 0
+  private pending: Promise<unknown> | null = null
+  private lastEmitted = ''
+
+  constructor(private readonly conversationId: string) {}
+
+  /** Start tracking once the target path of a write_file action is known. */
+  begin(path: string): void {
+    if (!this.path) this.path = path
+  }
+
+  /** Throttled partial write as `<content>` grows inside `buffer`. */
+  feed(buffer: string): void {
+    if (!this.path) return
+    if (this.contentStart < 0) {
+      const idx = buffer.indexOf('<content>')
+      if (idx >= 0) this.contentStart = idx + '<content>'.length
+    }
+    if (this.contentStart < 0) return
+    const now = Date.now()
+    if (now - this.lastWrite <= 450) return
+    this.lastWrite = now
+    this.writePartial(buffer)
+  }
+
+  private writePartial(buffer: string): void {
+    if (!this.path || this.contentStart < 0 || this.pending) return
+    let partial = buffer.slice(this.contentStart)
+    if (partial.startsWith('\n')) partial = partial.slice(1)
+    const closeIdx = partial.indexOf('</content>')
+    if (closeIdx >= 0) partial = partial.slice(0, closeIdx)
+    const cleaned = cleanFileContent(partial, this.path)
+    if (cleaned !== this.lastEmitted) {
+      this.lastEmitted = cleaned
+      send('file:streaming', {
+        conversationId: this.conversationId,
+        path: this.path,
+        content: cleaned,
+        done: false
+      })
+    }
+    this.pending = wsWriteFile(this.conversationId, this.path, cleaned)
+      .then(() => {
+        send('workspace:changed', { conversationId: this.conversationId } satisfies FileChangeEvent)
+      })
+      .catch(() => {
+        /* tolerate partial write failures */
+      })
+      .finally(() => {
+        this.pending = null
+      })
+  }
+
+  /** Final flush + reset once the action completes. No-op if no file was tracked. */
+  finish(): void {
+    if (this.path) {
+      send('file:streaming', {
+        conversationId: this.conversationId,
+        path: this.path,
+        content: this.lastEmitted,
+        done: true
+      })
+    }
+    this.path = null
+    this.contentStart = -1
+    this.lastWrite = 0
+    this.pending = null
+    this.lastEmitted = ''
+  }
+}
+
 async function handleChat(req: ChatRequest, channel: string): Promise<void> {
   const abort = new AbortController()
   chatAbortControllers.set(req.conversationId, abort)
@@ -170,33 +283,11 @@ async function handleChat(req: ChatRequest, channel: string): Promise<void> {
   const emit = (chunk: StreamChunk): void => send(channel, chunk)
 
   try {
-    const baseMessages: MLXChatMessage[] = []
-
-    if (req.mode === 'code') {
-      const wsPath = await ensureWorkspace(req.conversationId)
-      const href = previewUrl(req.conversationId)
-      baseMessages.push({ role: 'system', content: codeSystemPrompt(wsPath, href) })
-    } else {
-      baseMessages.push({ role: 'system', content: chatSystemPrompt(req.enableTools) })
-    }
-
-    for (const m of req.messages) {
-      baseMessages.push({ role: m.role as MLXChatMessage['role'], content: m.content })
-      if (m.toolCalls) {
-        for (const tc of m.toolCalls) {
-          if (tc.result != null) {
-            baseMessages.push({
-              role: 'tool',
-              content: `Result of <action name="${tc.name}">: ${tc.result}`
-            })
-          }
-        }
-      }
-    }
+    const baseMessages = await buildBaseMessages(req)
 
     const ctx: ToolContext = {
       conversationId: req.conversationId,
-      onFileChange: () => send('workspace:changed', { conversationId: req.conversationId })
+      onFileChange: () => send('workspace:changed', { conversationId: req.conversationId } satisfies FileChangeEvent)
     }
 
     const useTools = req.mode === 'code' || req.enableTools
@@ -211,40 +302,7 @@ async function handleChat(req: ChatRequest, channel: string): Promise<void> {
       let executedAction = false
       let lastActivityTs = 0
       let pendingAction: { name: string; target?: string } | null = null
-
-      // Live-write state for write_file streaming
-      let livePath: string | null = null
-      let liveContentStart = -1
-      let lastLiveWrite = 0
-      let livePending: Promise<unknown> | null = null
-      let lastEmittedContent = ''
-      const writeLivePartial = (): void => {
-        if (!livePath || liveContentStart < 0 || livePending) return
-        let partial = buffer.slice(liveContentStart)
-        if (partial.startsWith('\n')) partial = partial.slice(1)
-        const closeIdx = partial.indexOf('</content>')
-        if (closeIdx >= 0) partial = partial.slice(0, closeIdx)
-        const cleaned = cleanFileContent(partial, livePath)
-        if (cleaned !== lastEmittedContent) {
-          lastEmittedContent = cleaned
-          send('file:streaming', {
-            conversationId: req.conversationId,
-            path: livePath,
-            content: cleaned,
-            done: false
-          })
-        }
-        livePending = wsWriteFile(req.conversationId, livePath, cleaned)
-          .then(() => {
-            send('workspace:changed', { conversationId: req.conversationId })
-          })
-          .catch(() => {
-            /* tolerate partial write failures */
-          })
-          .finally(() => {
-            livePending = null
-          })
-      }
+      const liveFile = new LiveFileWriter(req.conversationId)
 
       const emitActivity = (): void => {
         const now = Date.now()
@@ -311,20 +369,10 @@ async function handleChat(req: ChatRequest, channel: string): Promise<void> {
           }
 
           // Live write_file streaming — create/update the file as <content> grows
-          if (pendingAction?.name === 'write_file' && pendingAction.target && !livePath) {
-            livePath = pendingAction.target
+          if (pendingAction?.name === 'write_file' && pendingAction.target) {
+            liveFile.begin(pendingAction.target)
           }
-          if (livePath && liveContentStart < 0) {
-            const idx = buffer.indexOf('<content>')
-            if (idx >= 0) liveContentStart = idx + '<content>'.length
-          }
-          if (livePath && liveContentStart >= 0) {
-            const now = Date.now()
-            if (now - lastLiveWrite > 450) {
-              lastLiveWrite = now
-              writeLivePartial()
-            }
-          }
+          liveFile.feed(buffer)
 
           emitActivity()
 
@@ -395,18 +443,8 @@ async function handleChat(req: ChatRequest, channel: string): Promise<void> {
               content: `[${hadError ? 'error' : 'ok'}] ${found.name}: ${result}`
             })
             executedAction = true
-            if (livePath) {
-              send('file:streaming', {
-                conversationId: req.conversationId,
-                path: livePath,
-                content: lastEmittedContent,
-                done: true
-              })
-            }
+            liveFile.finish()
             pendingAction = null
-            livePath = null
-            liveContentStart = -1
-            lastEmittedContent = ''
             emit({ type: 'activity', activity: { kind: 'thinking', chars: 0 } })
             // Break out of the current stream — we need to start a new
             // request with the updated conversation including the tool result.
