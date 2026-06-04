@@ -413,6 +413,11 @@ function Header({
                           rec
                         </span>
                       )}
+                      {m.runtime === 'mlx-vlm' && (
+                        <span className="rounded-full bg-sky-400/15 px-1.5 py-[1px] text-[9px] font-medium uppercase tracking-wider text-sky-300">
+                          Multimodal
+                        </span>
+                      )}
                       {m.draftModel && (
                         <span className="rounded-full bg-amber-400/15 px-1.5 py-[1px] text-[9px] font-medium uppercase tracking-wider text-amber-300">
                           ⚡
