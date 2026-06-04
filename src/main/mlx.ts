@@ -713,8 +713,20 @@ export interface MLXChatOptions {
   model: string
   messages: MLXChatMessage[]
   signal?: AbortSignal
+  /** Sampling — default to Gemma 4's recommended settings (see GEMMA_SAMPLING). */
   temperature?: number
+  topP?: number
+  topK?: number
+  maxTokens?: number
 }
+
+/**
+ * Gemma 4's recommended sampling settings, taken from the model's own
+ * generation_config.json (temperature 1.0, top_k 64, top_p 0.95) and confirmed
+ * by Google's docs. Note Gemma 4 is unusual: it performs *worse* at lower
+ * temperatures, so the previous 0.7 was actively degrading quality.
+ */
+const GEMMA_SAMPLING = { temperature: 1.0, topP: 0.95, topK: 64, maxTokens: 8192 }
 
 export async function* chatStream(
   opts: MLXChatOptions
@@ -729,8 +741,10 @@ export async function* chatStream(
         content: m.content
       })),
       stream: true,
-      temperature: opts.temperature ?? 0.7,
-      max_tokens: 8192
+      temperature: opts.temperature ?? GEMMA_SAMPLING.temperature,
+      top_p: opts.topP ?? GEMMA_SAMPLING.topP,
+      top_k: opts.topK ?? GEMMA_SAMPLING.topK,
+      max_tokens: opts.maxTokens ?? GEMMA_SAMPLING.maxTokens
     }),
     signal: opts.signal
   })
