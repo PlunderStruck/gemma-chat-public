@@ -17,10 +17,28 @@ export interface ToolContext {
 export interface ToolSpec {
   name: string
   description: string
-  params: Array<{ name: string; description: string; required?: boolean; multiline?: boolean }>
-  example: string
+  params: Array<{
+    name: string
+    description: string
+    required?: boolean
+    type?: 'string' | 'boolean' | 'number'
+  }>
   mode: 'chat' | 'code' | 'both'
   run: (args: Record<string, unknown>, ctx: ToolContext) => Promise<string>
+}
+
+/** An OpenAI-style function tool, derived from a ToolSpec for native tool calling. */
+export interface OpenAITool {
+  type: 'function'
+  function: {
+    name: string
+    description: string
+    parameters: {
+      type: 'object'
+      properties: Record<string, { type: string; description: string }>
+      required: string[]
+    }
+  }
 }
 
 const UA =
@@ -261,8 +279,6 @@ export const TOOLS: Record<string, ToolSpec> = {
     name: 'web_search',
     description: 'Search the web via DuckDuckGo. Returns a numbered list of results.',
     params: [{ name: 'query', description: 'what to search for', required: true }],
-    example:
-      '<action name="web_search">\n<query>latest tensorflow release notes</query>\n</action>',
     mode: 'both',
     run: webSearch
   },
@@ -270,7 +286,6 @@ export const TOOLS: Record<string, ToolSpec> = {
     name: 'fetch_url',
     description: 'Fetch a web page and return its text content (truncated to ~8KB).',
     params: [{ name: 'url', description: 'absolute http(s) URL', required: true }],
-    example: '<action name="fetch_url">\n<url>https://example.com</url>\n</action>',
     mode: 'both',
     run: fetchUrl
   },
@@ -278,7 +293,6 @@ export const TOOLS: Record<string, ToolSpec> = {
     name: 'calc',
     description: 'Evaluate a numeric expression.',
     params: [{ name: 'expression', description: 'math expression', required: true }],
-    example: '<action name="calc">\n<expression>2 + 2 * 3</expression>\n</action>',
     mode: 'both',
     run: calc
   },
@@ -288,10 +302,8 @@ export const TOOLS: Record<string, ToolSpec> = {
       'Create or overwrite a file in the workspace. Use this to generate code, HTML, CSS, JSON, etc.',
     params: [
       { name: 'path', description: 'path relative to workspace (e.g. index.html)', required: true },
-      { name: 'content', description: 'full file text', required: true, multiline: true }
+      { name: 'content', description: 'full file text', required: true }
     ],
-    example:
-      '<action name="write_file">\n<path>index.html</path>\n<content>\n<!doctype html>\n<html>\n<body>Hello</body>\n</html>\n</content>\n</action>',
     mode: 'code',
     run: writeFile
   },
@@ -299,22 +311,19 @@ export const TOOLS: Record<string, ToolSpec> = {
     name: 'read_file',
     description: 'Read a file from the workspace.',
     params: [{ name: 'path', description: 'path relative to workspace', required: true }],
-    example: '<action name="read_file">\n<path>index.html</path>\n</action>',
     mode: 'code',
     run: readFile
   },
   edit_file: {
     name: 'edit_file',
     description:
-      'Replace a snippet in an existing file. old_string must appear exactly once, or pass <replace_all>true</replace_all>.',
+      'Replace a snippet in an existing file. old_string must appear exactly once unless replace_all is true.',
     params: [
       { name: 'path', description: 'file path', required: true },
-      { name: 'old_string', description: 'exact text to find', required: true, multiline: true },
-      { name: 'new_string', description: 'replacement text', required: true, multiline: true },
-      { name: 'replace_all', description: 'true to replace every occurrence' }
+      { name: 'old_string', description: 'exact text to find', required: true },
+      { name: 'new_string', description: 'replacement text', required: true },
+      { name: 'replace_all', description: 'replace every occurrence', type: 'boolean' }
     ],
-    example:
-      '<action name="edit_file">\n<path>index.html</path>\n<old_string>Hello</old_string>\n<new_string>Hello, world</new_string>\n</action>',
     mode: 'code',
     run: editFile
   },
@@ -322,7 +331,6 @@ export const TOOLS: Record<string, ToolSpec> = {
     name: 'list_files',
     description: 'List every file in the workspace.',
     params: [],
-    example: '<action name="list_files"></action>',
     mode: 'code',
     run: listFiles
   },
@@ -330,7 +338,6 @@ export const TOOLS: Record<string, ToolSpec> = {
     name: 'delete_file',
     description: 'Delete a file or directory from the workspace.',
     params: [{ name: 'path', description: 'path to delete', required: true }],
-    example: '<action name="delete_file">\n<path>old.html</path>\n</action>',
     mode: 'code',
     run: deleteFile
   },
@@ -338,10 +345,7 @@ export const TOOLS: Record<string, ToolSpec> = {
     name: 'run_bash',
     description:
       'Run a bash command inside the workspace directory. Use for npm install, git, formatters, quick checks.',
-    params: [
-      { name: 'command', description: 'shell command', required: true, multiline: true }
-    ],
-    example: '<action name="run_bash">\n<command>ls -la</command>\n</action>',
+    params: [{ name: 'command', description: 'shell command', required: true }],
     mode: 'code',
     run: runBash
   },
@@ -350,7 +354,6 @@ export const TOOLS: Record<string, ToolSpec> = {
     description:
       'Reveal the Canvas preview. Call after creating or updating index.html so the user sees the result.',
     params: [],
-    example: '<action name="open_preview"></action>',
     mode: 'code',
     run: openPreview
   }
@@ -364,218 +367,64 @@ function tz(): string {
   }
 }
 
-function renderToolHelp(mode: 'chat' | 'code'): string {
-  const wanted = (t: ToolSpec): boolean => t.mode === 'both' || t.mode === mode
-  const lines: string[] = []
-  for (const t of Object.values(TOOLS)) {
-    if (!wanted(t)) continue
-    lines.push(`### ${t.name}`)
-    lines.push(t.description)
-    if (t.params.length) {
-      lines.push('Parameters:')
+/** Build the OpenAI `tools` array for a mode, deriving each schema from its params. */
+export function toolSchemas(mode: 'chat' | 'code'): OpenAITool[] {
+  return Object.values(TOOLS)
+    .filter((t) => t.mode === 'both' || t.mode === mode)
+    .map((t) => {
+      const properties: Record<string, { type: string; description: string }> = {}
+      const required: string[] = []
       for (const p of t.params) {
-        const req = p.required ? ' (required)' : ''
-        const multi = p.multiline ? ' — multi-line OK' : ''
-        lines.push(`  <${p.name}>: ${p.description}${req}${multi}`)
+        properties[p.name] = { type: p.type ?? 'string', description: p.description }
+        if (p.required) required.push(p.name)
       }
-    } else {
-      lines.push('No parameters.')
-    }
-    lines.push('Example:')
-    lines.push(t.example)
-    lines.push('')
-  }
-  return lines.join('\n')
+      return {
+        type: 'function',
+        function: {
+          name: t.name,
+          description: t.description,
+          parameters: { type: 'object', properties, required }
+        }
+      }
+    })
 }
 
 export function chatSystemPrompt(enableTools: boolean): string {
   const now = new Date().toISOString()
   const day = new Date().toLocaleDateString('en-US', { weekday: 'long' })
-  if (!enableTools) {
-    return [
-      "You are Gemma, an AI assistant running 100% locally on the user's Mac.",
-      `Current date/time: ${now} (${day}). Timezone: ${tz()}.`,
-      'Be clear, concise, and helpful. Use markdown for formatting when useful.'
-    ].join('\n')
-  }
-  return [
+  const lines = [
     "You are Gemma, an AI assistant running 100% locally on the user's Mac.",
     `Current date/time: ${now} (${day}). Timezone: ${tz()}.`,
-    '',
-    'TOOL USE',
-    '========',
-    'When a tool helps, emit ONE action block and STOP. You will receive the result, then you may continue or call another tool.',
-    '',
-    'Action format:',
-    '<action name="tool_name">',
-    '<param_name>value</param_name>',
-    '</action>',
-    '',
-    'Rules:',
-    '- One action per response, on its own line.',
-    '- Never wrap actions in markdown code fences.',
-    '- After writing </action>, STOP. Wait for the result before continuing.',
-    '- When finished, write a short plain-text answer and emit no more actions.',
-    '',
-    'Tools:',
-    '',
-    renderToolHelp('chat')
-  ].join('\n')
+    'Be clear, concise, and helpful. Use markdown for formatting when useful.'
+  ]
+  if (enableTools) {
+    lines.push(
+      'Call a tool only when it genuinely helps; otherwise just answer. After a tool returns, use its result to continue or give your final answer.'
+    )
+  }
+  return lines.join('\n')
 }
 
 export function codeSystemPrompt(workspacePath: string, previewHref: string): string {
   const now = new Date().toISOString()
   const day = new Date().toLocaleDateString('en-US', { weekday: 'long' })
   return [
-    "You are Gemma, a local coding agent running entirely on the user's Mac.",
+    "You are Gemma, a local coding agent running entirely on the user's Mac, building with the provided tools.",
     `Date: ${now} (${day}). Workspace: ${workspacePath}. Preview: ${previewHref}`,
     '',
-    'WHAT TO BUILD',
     'You build small apps, pages, demos, and scripts. Quality matters — the user is watching.',
     '- Modern, polished design by default: clean typography, generous whitespace, subtle gradients, rounded corners, smooth transitions. Dark-mode-friendly when it fits.',
-    '- Real-feeling copy, not lorem ipsum. Invent brand names and details.',
-    '- Make it actually work: click handlers wired, animations smooth, forms usable.',
-    '- Fetch real images only when asked; otherwise use CSS/SVG for illustrations.',
+    '- Real-feeling copy, not lorem ipsum. Make it actually work: handlers wired, animations smooth, forms usable.',
     '',
-    'FILE STRUCTURE — PREFER MULTI-FILE FOR ANYTHING NON-TRIVIAL',
-    '- One-off widgets / tiny demos → single `index.html` with <style> + <script> inline.',
-    '- Landing pages, apps with state, anything > ~200 lines → split into:',
-    '    `index.html` — structure + <link rel="stylesheet" href="style.css"> + <script src="app.js" defer></script>',
-    '    `style.css`  — all styling',
-    '    `app.js`     — all behavior',
-    '- Multi-file is easier to read, edit later, and shows off modular thinking. Emit a separate write_file action for each file.',
+    'Files:',
+    '- Tiny demos → one index.html with inline <style> and <script>.',
+    '- Anything larger → split into index.html + style.css + app.js, one write_file call per file.',
     '',
-    'HOW YOU WORK',
-    '1. Start with ONE sentence describing your plan (e.g., "I\'ll split this into index.html, style.css, and app.js."). Then IMMEDIATELY emit your first write_file action in the SAME response. Do NOT stop after planning — start building right away.',
-    '2. After each action, STOP and wait for the result. In subsequent turns, one sentence of narration (e.g., "Now the stylesheet."), then the action, then STOP.',
-    '3. After all files are written, call `open_preview`, then write a one-sentence plain-text summary. Emit no further actions.',
-    '',
-    'CRITICAL: You MUST emit a write_file action in your VERY FIRST response. Never respond with only a plan or description. Always start coding immediately.',
-    '',
-    'ACTION FORMAT — EXACT',
-    '<action name="tool_name">',
-    '<param_name>value</param_name>',
-    '</action>',
-    '',
-    '<content> RULES — READ TWICE',
-    'The string between <content> and </content> is WRITTEN TO DISK LITERALLY. Everything is saved.',
-    '- NEVER put ``` fences at the start or end of <content>. Not ``` alone, not ```html, not ```js. None.',
-    '- NEVER put explanatory text, "Key Features", "Instructions to Use", or any commentary INSIDE <content>. Only the file contents.',
-    '- Close <content> with </content> on its own line, immediately after the last line of the file.',
-    '- Then close the action with </action> on its own line.',
-    '',
-    'EXAMPLE — multi-file build (FIRST response)',
-    '',
-    "I'll split this into three files: index.html for structure, style.css for the design, and app.js for the countdown behavior. Starting with the HTML shell.",
-    '',
-    '<action name="write_file">',
-    '<path>index.html</path>',
-    '<content>',
-    '<!doctype html>',
-    '<html lang="en">',
-    '<head>',
-    '<meta charset="utf-8">',
-    '<title>Coming Soon</title>',
-    '<link rel="stylesheet" href="style.css">',
-    '<script src="app.js" defer></script>',
-    '</head>',
-    '<body><main><h1>Coming soon</h1></main></body>',
-    '</html>',
-    '</content>',
-    '</action>',
-    '',
-    'HARD RULES',
-    '- ALWAYS start coding in your first response. Never reply with only a plan.',
-    '- Never paste file contents in your chat reply — only inside <content>.',
-    '- Never wrap <action> tags in ``` code fences.',
-    '- Paths are relative to the workspace (no leading slashes).',
-    '- One action per response, then STOP and wait.',
-    '',
-    'AVAILABLE TOOLS',
-    '',
-    renderToolHelp('code')
+    'How you work:',
+    '- Start building immediately by calling write_file — never reply with only a plan.',
+    '- After the files are written, call open_preview, then give a one-sentence summary.',
+    '- Paths are relative to the workspace (no leading slash).'
   ].join('\n')
-}
-
-export interface ParsedAction {
-  name: string
-  args: Record<string, unknown>
-  raw: string
-  start: number
-  end: number
-}
-
-export function findNextAction(text: string, from = 0): ParsedAction | 'incomplete' | null {
-  // Accept variations: <action name="x">, name='x', name=x, case-insensitive
-  const openRe = /<action\s+name\s*=\s*["']?([a-zA-Z_][\w]*)["']?\s*>/gi
-  openRe.lastIndex = from
-  const open = openRe.exec(text)
-  if (!open) return null
-  const name = open[1]
-  const bodyStart = open.index + open[0].length
-  const closeMatch = text.slice(bodyStart).match(/<\/action\s*>/i)
-  if (!closeMatch || closeMatch.index === undefined) return 'incomplete'
-  const closeIdx = bodyStart + closeMatch.index
-  const body = text.slice(bodyStart, closeIdx)
-  const args = parseActionBody(body)
-  return {
-    name,
-    args,
-    raw: text.slice(open.index, closeIdx + closeMatch[0].length),
-    start: open.index,
-    end: closeIdx + closeMatch[0].length
-  }
-}
-
-function parseActionBody(body: string): Record<string, unknown> {
-  const args: Record<string, unknown> = {}
-
-  // Special-case <content>…</content> — use the LAST </content> to survive nested close-tags
-  const contentOpen = body.indexOf('<content>')
-  let outside = body
-  if (contentOpen >= 0) {
-    const contentCloseRel = body.lastIndexOf('</content>')
-    if (contentCloseRel > contentOpen) {
-      let content = body.slice(contentOpen + '<content>'.length, contentCloseRel)
-      content = content.replace(/^\n/, '')
-      content = content.replace(/\n[ \t]*$/, '')
-      args.content = content
-      outside = body.slice(0, contentOpen) + body.slice(contentCloseRel + '</content>'.length)
-    }
-  }
-
-  const tagRe = /<([a-zA-Z_][\w-]*)>([\s\S]*?)<\/\1>/g
-  let m: RegExpExecArray | null
-  while ((m = tagRe.exec(outside)) !== null) {
-    const key = m[1]
-    if (key === 'content') continue
-    const raw = m[2]
-    const trimmed = raw.trim()
-    if (trimmed === 'true') args[key] = true
-    else if (trimmed === 'false') args[key] = false
-    else if (/^-?\d+$/.test(trimmed)) args[key] = Number(trimmed)
-    else args[key] = raw.replace(/^\n/, '').replace(/\n[ \t]*$/, '')
-  }
-  return args
-}
-
-export function emitSafeBoundary(buffer: string, from: number): number {
-  // Return the largest index ≤ buffer.length such that the slice [from, idx)
-  // cannot be the start of a forming <action ...> tag.
-  // Scan backwards from the end for a '<' that could start "<action".
-  for (let i = buffer.length - 1; i >= from; i--) {
-    if (buffer[i] !== '<') continue
-    const tail = buffer.slice(i).toLowerCase()
-    // Could this be the start of "<action"? If tail is shorter than "<action"
-    // we can't be sure yet — hold back.
-    if (tail.length < 8) {
-      if ('<action'.startsWith(tail)) return i
-      continue
-    }
-    if (tail.startsWith('<action') && /\s/.test(tail[7])) return i
-    // Otherwise this '<' is some other tag — safe.
-  }
-  return buffer.length
 }
 
 export async function runTool(

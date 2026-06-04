@@ -10,16 +10,15 @@ import {
   chatStream,
   listLocalModels,
   isModelCached,
-  type MLXChatMessage
+  type MLXChatMessage,
+  type ParsedToolCall
 } from './mlx'
 import {
   TOOLS,
   chatSystemPrompt,
   codeSystemPrompt,
-  findNextAction,
-  emitSafeBoundary,
+  toolSchemas,
   runTool,
-  cleanFileContent,
   type ToolContext
 } from './tools'
 import {
@@ -29,10 +28,9 @@ import {
   getWorkspaceServerPort,
   previewUrl,
   listTree,
-  workspaceDir,
-  wsWriteFile
+  workspaceDir
 } from './workspace'
-import type { ChatRequest, StreamChunk, ToolCall, FileChangeEvent } from '../shared/types'
+import type { ChatRequest, StreamChunk, FileChangeEvent } from '../shared/types'
 
 let mainWindow: BrowserWindow | null = null
 
@@ -202,100 +200,33 @@ async function buildBaseMessages(req: ChatRequest): Promise<MLXChatMessage[]> {
   }
 
   for (const m of req.messages) {
-    baseMessages.push({ role: m.role as MLXChatMessage['role'], content: m.content })
-    if (m.toolCalls) {
-      for (const tc of m.toolCalls) {
-        if (tc.result != null) {
-          baseMessages.push({
-            role: 'tool',
-            content: `Result of <action name="${tc.name}">: ${tc.result}`
-          })
-        }
+    // Replay a tool-calling assistant turn as native tool_calls + paired tool
+    // results (every tool_call must have a matching tool message).
+    const calls = (m.toolCalls ?? []).filter((tc) => tc.result != null || tc.error != null)
+    if (m.role === 'assistant' && calls.length) {
+      baseMessages.push({
+        role: 'assistant',
+        content: m.content,
+        tool_calls: calls.map((tc) => ({
+          id: tc.id,
+          type: 'function',
+          function: { name: tc.name, arguments: JSON.stringify(tc.args ?? {}) }
+        }))
+      })
+      for (const tc of calls) {
+        baseMessages.push({
+          role: 'tool',
+          tool_call_id: tc.id,
+          name: tc.name,
+          content: tc.result ?? tc.error ?? ''
+        })
       }
+    } else {
+      baseMessages.push({ role: m.role as MLXChatMessage['role'], content: m.content })
     }
   }
 
   return baseMessages
-}
-
-/**
- * Streams a `write_file` action's `<content>` to disk as it arrives, so the
- * Build-mode canvas can show the file materialising live. Owns the throttling,
- * partial-content extraction, and preview/persist effects for one file at a
- * time; reset (via finish) between actions.
- */
-class LiveFileWriter {
-  private path: string | null = null
-  private contentStart = -1
-  private lastWrite = 0
-  private pending: Promise<unknown> | null = null
-  private lastEmitted = ''
-
-  constructor(private readonly conversationId: string) {}
-
-  /** Start tracking once the target path of a write_file action is known. */
-  begin(path: string): void {
-    if (!this.path) this.path = path
-  }
-
-  /** Throttled partial write as `<content>` grows inside `buffer`. */
-  feed(buffer: string): void {
-    if (!this.path) return
-    if (this.contentStart < 0) {
-      const idx = buffer.indexOf('<content>')
-      if (idx >= 0) this.contentStart = idx + '<content>'.length
-    }
-    if (this.contentStart < 0) return
-    const now = Date.now()
-    if (now - this.lastWrite <= 450) return
-    this.lastWrite = now
-    this.writePartial(buffer)
-  }
-
-  private writePartial(buffer: string): void {
-    if (!this.path || this.contentStart < 0 || this.pending) return
-    let partial = buffer.slice(this.contentStart)
-    if (partial.startsWith('\n')) partial = partial.slice(1)
-    const closeIdx = partial.indexOf('</content>')
-    if (closeIdx >= 0) partial = partial.slice(0, closeIdx)
-    const cleaned = cleanFileContent(partial, this.path)
-    if (cleaned !== this.lastEmitted) {
-      this.lastEmitted = cleaned
-      send('file:streaming', {
-        conversationId: this.conversationId,
-        path: this.path,
-        content: cleaned,
-        done: false
-      })
-    }
-    this.pending = wsWriteFile(this.conversationId, this.path, cleaned)
-      .then(() => {
-        send('workspace:changed', { conversationId: this.conversationId } satisfies FileChangeEvent)
-      })
-      .catch(() => {
-        /* tolerate partial write failures */
-      })
-      .finally(() => {
-        this.pending = null
-      })
-  }
-
-  /** Final flush + reset once the action completes. No-op if no file was tracked. */
-  finish(): void {
-    if (this.path) {
-      send('file:streaming', {
-        conversationId: this.conversationId,
-        path: this.path,
-        content: this.lastEmitted,
-        done: true
-      })
-    }
-    this.path = null
-    this.contentStart = -1
-    this.lastWrite = 0
-    this.pending = null
-    this.lastEmitted = ''
-  }
 }
 
 async function handleChat(req: ChatRequest, channel: string): Promise<void> {
@@ -309,45 +240,25 @@ async function handleChat(req: ChatRequest, channel: string): Promise<void> {
 
     const ctx: ToolContext = {
       conversationId: req.conversationId,
-      onFileChange: () => send('workspace:changed', { conversationId: req.conversationId } satisfies FileChangeEvent)
+      onFileChange: () =>
+        send('workspace:changed', { conversationId: req.conversationId } satisfies FileChangeEvent)
     }
 
-    const useTools = req.mode === 'code' || req.enableTools
+    const tools =
+      req.mode === 'code' ? toolSchemas('code') : req.enableTools ? toolSchemas('chat') : undefined
     const maxRounds = req.mode === 'code' ? MAX_TOOL_ROUNDS_CODE : MAX_TOOL_ROUNDS_CHAT
 
     emit({ type: 'activity', activity: { kind: 'thinking', chars: 0 } })
 
     for (let round = 0; round < maxRounds; round++) {
-      let buffer = ''
-      let emittedIdx = 0
+      let assistantText = ''
+      let toolCalls: ParsedToolCall[] = []
       let firstToken = true
-      let executedAction = false
-      let lastActivityTs = 0
-      let pendingAction: { name: string; target?: string } | null = null
-      const liveFile = new LiveFileWriter(req.conversationId)
 
-      const emitActivity = (): void => {
-        const now = Date.now()
-        if (now - lastActivityTs < 400) return
-        lastActivityTs = now
-        if (pendingAction) {
-          emit({
-            type: 'activity',
-            activity: {
-              kind: 'tool',
-              tool: pendingAction.name,
-              target: pendingAction.target,
-              chars: buffer.length
-            }
-          })
-        } else {
-          emit({ type: 'activity', activity: { kind: 'generating', chars: buffer.length } })
-        }
-      }
-
-      streamLoop: for await (const chunk of chatStream({
+      for await (const chunk of chatStream({
         model: req.model,
         messages: baseMessages,
+        tools,
         signal: abort.signal
       })) {
         if (chunk.content) {
@@ -355,151 +266,89 @@ async function handleChat(req: ChatRequest, channel: string): Promise<void> {
             firstToken = false
             emit({ type: 'activity', activity: { kind: 'generating', chars: 0 } })
           }
-          buffer += chunk.content
-
-          // Forward raw token to devtools console for debugging
+          assistantText += chunk.content
+          emit({ type: 'token', text: chunk.content })
           mainWindow?.webContents.send('chat:raw', {
             conversationId: req.conversationId,
             chunk: chunk.content
           })
-
-          // Detect if we've started an action (for activity label + live writes)
-          if (!pendingAction) {
-            const openMatch = buffer
-              .slice(emittedIdx)
-              .match(/<action\s+name\s*=\s*["']?([a-zA-Z_][\w]*)["']?\s*>/i)
-            if (openMatch) {
-              const name = openMatch[1]
-              const rest = buffer.slice(emittedIdx + (openMatch.index ?? 0))
-              const pathM = rest.match(/<path>([^<]+?)<\/path>/i)
-              const urlM = rest.match(/<url>([^<]+?)<\/url>/i)
-              const qM = rest.match(/<query>([^<]+?)<\/query>/i)
-              const cmdM = rest.match(/<command>([^<\n]+)/i)
-              pendingAction = {
-                name,
-                target: pathM?.[1] || urlM?.[1] || qM?.[1] || cmdM?.[1]
-              }
-            }
-          } else if (!pendingAction.target) {
-            const rest = buffer.slice(emittedIdx)
-            const pathM = rest.match(/<path>([^<]+?)<\/path>/i)
-            const urlM = rest.match(/<url>([^<]+?)<\/url>/i)
-            const qM = rest.match(/<query>([^<]+?)<\/query>/i)
-            const cmdM = rest.match(/<command>([^<\n]+)/i)
-            const t = pathM?.[1] || urlM?.[1] || qM?.[1] || cmdM?.[1]
-            if (t) pendingAction.target = t
-          }
-
-          // Live write_file streaming — create/update the file as <content> grows
-          if (pendingAction?.name === 'write_file' && pendingAction.target) {
-            liveFile.begin(pendingAction.target)
-          }
-          liveFile.feed(buffer)
-
-          emitActivity()
-
-          while (true) {
-            if (!useTools) {
-              // No tool parsing: stream tokens as they arrive
-              if (emittedIdx < buffer.length) {
-                emit({ type: 'token', text: buffer.slice(emittedIdx) })
-                emittedIdx = buffer.length
-              }
-              break
-            }
-
-            const found = findNextAction(buffer, emittedIdx)
-
-            if (found === null) {
-              // No action starting in the remaining buffer: emit safe text
-              const safe = emitSafeBoundary(buffer, emittedIdx)
-              if (safe > emittedIdx) {
-                emit({ type: 'token', text: buffer.slice(emittedIdx, safe) })
-                emittedIdx = safe
-              }
-              break
-            }
-
-            if (found === 'incomplete') {
-              // Action has started but not closed. Emit text up to the open tag.
-              const openIdx = buffer.indexOf('<action', emittedIdx)
-              if (openIdx > emittedIdx) {
-                emit({ type: 'token', text: buffer.slice(emittedIdx, openIdx) })
-                emittedIdx = openIdx
-              }
-              break
-            }
-
-            // Emit any text between last emit and action start
-            if (found.start > emittedIdx) {
-              emit({ type: 'token', text: buffer.slice(emittedIdx, found.start) })
-            }
-            emittedIdx = found.end
-
-            const call: ToolCall = {
-              id: `call_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
-              name: found.name,
-              args: found.args,
-              running: true
-            }
-            emit({ type: 'tool_call', call })
-            emit({
-              type: 'activity',
-              activity: { kind: 'tool', tool: found.name, target: actionTarget(found.name, found.args) }
-            })
-
-            let result: string
-            let hadError = false
-            try {
-              result = await runTool(found.name, found.args, ctx)
-              emit({ type: 'tool_result', id: call.id, result })
-            } catch (e) {
-              result = `Error: ${(e as Error).message}`
-              hadError = true
-              emit({ type: 'tool_result', id: call.id, error: result })
-            }
-
-            baseMessages.push({ role: 'assistant', content: buffer.slice(0, emittedIdx) })
-            baseMessages.push({
-              role: 'tool',
-              content: `[${hadError ? 'error' : 'ok'}] ${found.name}: ${result}`
-            })
-            executedAction = true
-            liveFile.finish()
-            pendingAction = null
-            emit({ type: 'activity', activity: { kind: 'thinking', chars: 0 } })
-            // Break out of the current stream — we need to start a new
-            // request with the updated conversation including the tool result.
-            break streamLoop
-          }
         }
-        if (chunk.done) {
-          break streamLoop
-        }
+        if (chunk.toolCalls) toolCalls = chunk.toolCalls
+        if (chunk.done) break
       }
 
-      if (!executedAction) {
-        // In Build mode, if the model just described a plan without writing code,
-        // nudge it to start coding immediately instead of ending the turn.
-        if (req.mode === 'code' && round === 0 && buffer.trim().length > 0) {
-          // Flush the plan text to the UI
-          if (emittedIdx < buffer.length) {
-            emit({ type: 'token', text: buffer.slice(emittedIdx) })
-          }
-          baseMessages.push({ role: 'assistant', content: buffer })
+      if (toolCalls.length === 0) {
+        // No tools called — the model gave its final answer. In Build mode, if it
+        // only planned on the first turn, nudge it once to start building.
+        if (req.mode === 'code' && round === 0 && assistantText.trim()) {
+          baseMessages.push({ role: 'assistant', content: assistantText })
           baseMessages.push({
             role: 'user',
-            content:
-              'Good plan. Now start building — emit a write_file action with the first file immediately.'
+            content: 'Good plan. Now start building — call write_file with the first file.'
           })
           emit({ type: 'activity', activity: { kind: 'thinking', chars: 0 } })
-          continue // go to round 1
+          continue
         }
         emit({ type: 'activity', activity: { kind: 'idle' } })
         emit({ type: 'done' })
         return
       }
+
+      // Record the assistant turn (its narration + native tool calls).
+      baseMessages.push({
+        role: 'assistant',
+        content: assistantText,
+        tool_calls: toolCalls.map((tc) => ({
+          id: tc.id,
+          type: 'function',
+          function: { name: tc.name, arguments: JSON.stringify(tc.args) }
+        }))
+      })
+
+      // Run each tool, stream its result, and append a paired tool message.
+      for (const tc of toolCalls) {
+        emit({ type: 'tool_call', call: { id: tc.id, name: tc.name, args: tc.args, running: true } })
+        emit({
+          type: 'activity',
+          activity: { kind: 'tool', tool: tc.name, target: actionTarget(tc.name, tc.args) }
+        })
+
+        let result: string
+        let hadError = false
+        try {
+          result = await runTool(tc.name, tc.args, ctx)
+          emit({ type: 'tool_result', id: tc.id, result })
+        } catch (e) {
+          result = `Error: ${(e as Error).message}`
+          hadError = true
+          emit({ type: 'tool_result', id: tc.id, error: result })
+        }
+
+        // Surface a written file to the Build canvas (no live token streaming now).
+        if (
+          tc.name === 'write_file' &&
+          typeof tc.args.path === 'string' &&
+          typeof tc.args.content === 'string'
+        ) {
+          send('file:streaming', {
+            conversationId: req.conversationId,
+            path: tc.args.path,
+            content: tc.args.content,
+            done: true
+          })
+        }
+
+        baseMessages.push({
+          role: 'tool',
+          tool_call_id: tc.id,
+          name: tc.name,
+          content: `[${hadError ? 'error' : 'ok'}] ${result}`
+        })
+      }
+
+      emit({ type: 'activity', activity: { kind: 'thinking', chars: 0 } })
     }
+
     emit({ type: 'activity', activity: { kind: 'idle' } })
     emit({
       type: 'error',

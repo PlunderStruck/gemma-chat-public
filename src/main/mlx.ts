@@ -2,6 +2,7 @@ import { app } from 'electron'
 import { spawn, ChildProcess, spawnSync } from 'child_process'
 import { join } from 'path'
 import { existsSync, readdirSync, readFileSync, rmSync, statSync } from 'fs'
+import type { OpenAITool } from './tools'
 
 const MLX_PORT = 11434
 const MLX_HOST = `127.0.0.1:${MLX_PORT}`
@@ -703,16 +704,37 @@ export async function listLocalModels(): Promise<string[]> {
 // Chat streaming (OpenAI-compatible SSE)
 // ---------------------------------------------------------------------------
 
+/** An assistant's native tool call (OpenAI shape) as sent back in the history. */
+export interface NativeToolCall {
+  id: string
+  type: 'function'
+  function: { name: string; arguments: string }
+}
+
 export interface MLXChatMessage {
   role: 'user' | 'assistant' | 'system' | 'tool'
   content: string
   images?: string[]
+  /** On assistant turns that called tools. */
+  tool_calls?: NativeToolCall[]
+  /** On tool-result turns: which call this answers, and the tool's name. */
+  tool_call_id?: string
+  name?: string
+}
+
+/** A tool call surfaced from the stream with its arguments parsed. */
+export interface ParsedToolCall {
+  id: string
+  name: string
+  args: Record<string, unknown>
 }
 
 export interface MLXChatOptions {
   model: string
   messages: MLXChatMessage[]
   signal?: AbortSignal
+  /** When provided, sent as native `tools` with `tool_choice: 'auto'`. */
+  tools?: OpenAITool[]
   /** Sampling — default to Gemma 4's recommended settings (see GEMMA_SAMPLING). */
   temperature?: number
   topP?: number
@@ -728,24 +750,43 @@ export interface MLXChatOptions {
  */
 const GEMMA_SAMPLING = { temperature: 1.0, topP: 0.95, topK: 64, maxTokens: 8192 }
 
+function safeParseArgs(json: string): Record<string, unknown> {
+  try {
+    const v = JSON.parse(json || '{}')
+    return v && typeof v === 'object' ? (v as Record<string, unknown>) : {}
+  } catch {
+    return {}
+  }
+}
+
 export async function* chatStream(
   opts: MLXChatOptions
-): AsyncGenerator<{ content?: string; done?: boolean }> {
+): AsyncGenerator<{ content?: string; toolCalls?: ParsedToolCall[]; done?: boolean }> {
+  const body: Record<string, unknown> = {
+    model: opts.model,
+    messages: opts.messages.map((m) => ({
+      role: m.role,
+      content: m.content,
+      ...(m.images?.length ? { images: m.images } : {}),
+      ...(m.tool_calls ? { tool_calls: m.tool_calls } : {}),
+      ...(m.tool_call_id ? { tool_call_id: m.tool_call_id } : {}),
+      ...(m.name ? { name: m.name } : {})
+    })),
+    stream: true,
+    temperature: opts.temperature ?? GEMMA_SAMPLING.temperature,
+    top_p: opts.topP ?? GEMMA_SAMPLING.topP,
+    top_k: opts.topK ?? GEMMA_SAMPLING.topK,
+    max_tokens: opts.maxTokens ?? GEMMA_SAMPLING.maxTokens
+  }
+  if (opts.tools?.length) {
+    body.tools = opts.tools
+    body.tool_choice = 'auto'
+  }
+
   const res = await fetch(`${MLX_URL}/v1/chat/completions`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({
-      model: opts.model,
-      messages: opts.messages.map((m) => ({
-        role: m.role,
-        content: m.content
-      })),
-      stream: true,
-      temperature: opts.temperature ?? GEMMA_SAMPLING.temperature,
-      top_p: opts.topP ?? GEMMA_SAMPLING.topP,
-      top_k: opts.topK ?? GEMMA_SAMPLING.topK,
-      max_tokens: opts.maxTokens ?? GEMMA_SAMPLING.maxTokens
-    }),
+    body: JSON.stringify(body),
     signal: opts.signal
   })
 
@@ -754,32 +795,50 @@ export async function* chatStream(
     throw new Error(`Chat request failed: ${res.status} ${res.statusText} — ${text}`)
   }
 
-  // Parse SSE stream (OpenAI format: "data: {...}\n\n")
+  // Tool calls stream as partial deltas keyed by index; accumulate and flush
+  // them (with arguments parsed) when the turn finishes.
+  const acc = new Map<number, { id: string; name: string; args: string }>()
+  const flush = (): ParsedToolCall[] =>
+    [...acc.values()].map((t) => ({ id: t.id || `call_${t.name}`, name: t.name, args: safeParseArgs(t.args) }))
+
   const stream = res.body as unknown as ReadableStream<Uint8Array>
   for await (const event of readSSE(stream)) {
-    if (event === '[DONE]') {
+    if (event === '[DONE]') break
+    let parsed: {
+      choices?: Array<{
+        delta?: {
+          content?: string
+          tool_calls?: Array<{
+            index?: number
+            id?: string
+            function?: { name?: string; arguments?: string }
+          }>
+        }
+        finish_reason?: string | null
+      }>
+    }
+    try {
+      parsed = JSON.parse(event)
+    } catch {
+      continue
+    }
+    const choice = parsed.choices?.[0]
+    if (!choice) continue
+    if (choice.delta?.content) yield { content: choice.delta.content }
+    for (const tc of choice.delta?.tool_calls ?? []) {
+      const e = acc.get(tc.index ?? 0) ?? { id: '', name: '', args: '' }
+      if (tc.id) e.id = tc.id
+      if (tc.function?.name) e.name = tc.function.name
+      if (tc.function?.arguments) e.args += tc.function.arguments
+      acc.set(tc.index ?? 0, e)
+    }
+    if (choice.finish_reason) {
+      if (acc.size) yield { toolCalls: flush() }
       yield { done: true }
       return
     }
-    try {
-      const parsed = JSON.parse(event) as {
-        choices?: Array<{
-          delta?: { content?: string; role?: string }
-          finish_reason?: string | null
-        }>
-      }
-      const choice = parsed.choices?.[0]
-      if (choice?.delta?.content) {
-        yield { content: choice.delta.content }
-      }
-      if (choice?.finish_reason === 'stop' || choice?.finish_reason === 'length') {
-        yield { done: true }
-        return
-      }
-    } catch {
-      // Skip malformed events
-    }
   }
+  if (acc.size) yield { toolCalls: flush() }
   yield { done: true }
 }
 
